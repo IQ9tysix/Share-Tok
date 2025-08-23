@@ -342,8 +342,12 @@ sentiment_analyzer = SentimentAnalyzer()
 # Create directories
 os.makedirs(Config.UPLOAD_FOLDER, exist_ok=True)
 
+
 # Initialize Dash app
 app = dash.Dash(__name__, suppress_callback_exceptions=True)
+
+# Add this line to expose the server for gunicorn
+server = app.server
 
 # Initialize sample data
 def init_sample_data():
@@ -1464,7 +1468,7 @@ if __name__ == '__main__':
     print("- Creator: username='creator1', password='creator123'")
     
     # Start the application
-    app.run(
+    app.run_server(
         debug=True,
         host='0.0.0.0',
         port=8050
