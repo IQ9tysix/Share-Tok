@@ -31,7 +31,10 @@ jobs:
           pip install -r requirements.txt
           # Create build artifacts
           mkdir -p build
-          cp -r . build/
+          # Copy files excluding the build directory itself
+          find . -name "build" -prune -o -type f -print0 | xargs -0 cp --parents -t build/
+          # Alternative approach using rsync (if available):
+          # rsync -av --exclude='build' . build/
           cd build
           pip install -r requirements.txt --target .
 
