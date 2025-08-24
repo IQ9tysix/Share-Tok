@@ -1,0 +1,50 @@
+2025-08-24 08:34:34,773 - INFO - Dash is running on http://0.0.0.0:8050/
+
+2025-08-24 08:43:06,094 - ERROR - Error fetching videos: Execution failed on sql '
+                SELECT v.*, u.username as creator_name
+                FROM videos v
+                JOIN users u ON v.creator_id = u.id
+                WHERE v.status = 'ready'
+             AND v.creator_id = ? ORDER BY v.upload_date DESC': no such table: videos
+2025-08-24 08:43:11,097 - ERROR - Error fetching videos: Execution failed on sql '
+                SELECT v.*, u.username as creator_name
+                FROM videos v
+                JOIN users u ON v.creator_id = u.id
+                WHERE v.status = 'ready'
+             AND v.creator_id = ? ORDER BY v.upload_date DESC': no such table: videos
+2025-08-24 08:43:16,097 - ERROR - Error fetching videos: Execution failed on sql '
+                SELECT v.*, u.username as creator_name
+                FROM videos v
+                JOIN users u ON v.creator_id = u.id
+                WHERE v.status = 'ready'
+             AND v.creator_id = ? ORDER BY v.upload_date DESC': no such table: videos
+2025-08-24 08:43:22,088 - ERROR - Error fetching videos: Execution failed on sql '
+                SELECT v.*, u.username as creator_name
+                FROM videos v
+                JOIN users u ON v.creator_id = u.id
+                WHERE v.status = 'ready'
+             AND v.creator_id = ? ORDER BY v.upload_date DESC': no such table: videos
+2025-08-24 08:43:27,137 - ERROR - Error fetching videos: Execution failed on sql '
+                SELECT v.*, u.username as creator_name
+                FROM videos v
+                JOIN users u ON v.creator_id = u.id
+                WHERE v.status = 'ready'
+             AND v.creator_id = ? ORDER BY v.upload_date DESC': no such table: videos
+2025-08-24 08:43:31,337 - ERROR - Error fetching videos: Execution failed on sql '
+                SELECT v.*, u.username as creator_name
+                FROM videos v
+                JOIN users u ON v.creator_id = u.id
+                WHERE v.status = 'ready'
+             AND v.creator_id = ? ORDER BY v.upload_date DESC': no such table: videos
+2025-08-24 08:43:37,943 - ERROR - Authentication error: no such table: users
+2025-08-24 08:43:48,920 - ERROR - Authentication error: no such table: users
+2025-08-24 08:43:50,248 - ERROR - Authentication error: no such table: users
+2025-08-24 08:44:11,522 - ERROR - Database error during user creation: no such table: users
+2025-08-24 08:44:34,179 - ERROR - Authentication error: no such table: users
+2025-08-24 08:44:41,841 - ERROR - Authentication error: no such table: users
+2025-08-24 08:44:54,665 - ERROR - Authentication error: no such table: users
+2025-08-24 08:45:16,913 - ERROR - Database error during user creation: no such table: users
+2025-08-24 08:45:23,134 - ERROR - Database error during user creation: no such table: users
+2025-08-24 08:45:23,981 - ERROR - Database error during user creation: no such table: users
+2025-08-24 08:45:27,121 - ERROR - Database error during user creation: no such table: users
+2025-08-24 08:45:31,276 - ERROR - Database error during user creation: no such table: users

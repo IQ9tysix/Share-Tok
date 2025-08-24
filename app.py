@@ -20,8 +20,7 @@ import time
 import threading
 from dataclasses import dataclass
 from enum import Enum
-
-# Configuration
+from flask import send_from_directory
 class Config:
     UPLOAD_FOLDER = 'uploads'
     DATABASE_PATH = 'video_platform.db'
@@ -69,156 +68,245 @@ class Video:
     sentiment_score: float = 0.0
     content_tags: list = None
 
-# Database Manager
+# Enhanced Database Manager with better error handling
 class DatabaseManager:
     def __init__(self, db_path: str):
         self.db_path = db_path
+        self.ensure_database_directory()
         self.init_database()
     
-    def get_connection(self):
-        """Get database connection with error handling"""
+    def ensure_database_directory(self):
+        """Ensure the database directory exists"""
         try:
-            return sqlite3.connect(self.db_path)
+            db_dir = os.path.dirname(self.db_path)
+            if db_dir and not os.path.exists(db_dir):
+                os.makedirs(db_dir)
+        except Exception as e:
+            logging.error(f"Error creating database directory: {e}")
+    
+    def get_connection(self):
+        """Get database connection with error handling and proper configuration"""
+        try:
+            conn = sqlite3.connect(
+                self.db_path,
+                timeout=30,  # 30 second timeout
+                check_same_thread=False  # Allow use across threads
+            )
+            conn.execute("PRAGMA foreign_keys = ON")  # Enable foreign keys
+            conn.execute("PRAGMA journal_mode = WAL")  # Better concurrency
+            return conn
         except Exception as e:
             logging.error(f"Database connection error: {e}")
             raise
     
+    def reset_database(self):
+        """Reset/recreate the entire database - use with caution"""
+        try:
+            if os.path.exists(self.db_path):
+                os.remove(self.db_path)
+                logging.info("Removed existing database file")
+            
+            # Remove WAL files if they exist
+            for suffix in ['-wal', '-shm']:
+                wal_file = self.db_path + suffix
+                if os.path.exists(wal_file):
+                    os.remove(wal_file)
+            
+            self.init_database()
+            logging.info("Database reset and reinitialized successfully")
+        except Exception as e:
+            logging.error(f"Error resetting database: {e}")
+            raise
+    
     def init_database(self):
         """Initialize database with required tables"""
-        conn = self.get_connection()
-        cursor = conn.cursor()
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                conn = self.get_connection()
+                cursor = conn.cursor()
+                
+                # Create tables in order (respecting foreign key dependencies)
+                self._create_users_table(cursor)
+                self._create_videos_table(cursor)
+                self._create_comments_table(cursor)
+                self._create_user_interactions_table(cursor)
+                self._create_saved_videos_table(cursor)
+                
+                conn.commit()
+                logging.info("Database initialized successfully")
+                
+                # Verify tables were created
+                self._verify_tables(cursor)
+                
+                conn.close()
+                return  # Success, exit retry loop
+                
+            except Exception as e:
+                logging.error(f"Database initialization attempt {attempt + 1} failed: {e}")
+                if conn:
+                    try:
+                        conn.rollback()
+                        conn.close()
+                    except:
+                        pass
+                
+                if attempt == max_retries - 1:
+                    # Last attempt failed, try to reset
+                    logging.warning("All initialization attempts failed, trying to reset database")
+                    try:
+                        self.reset_database()
+                        return
+                    except Exception as reset_error:
+                        logging.error(f"Database reset also failed: {reset_error}")
+                        raise Exception(f"Failed to initialize database after {max_retries} attempts")
+    
+    def _create_users_table(self, cursor):
+        """Create users table"""
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS users (
+                id TEXT PRIMARY KEY,
+                username TEXT UNIQUE NOT NULL,
+                email TEXT UNIQUE NOT NULL,
+                password_hash TEXT NOT NULL,
+                role TEXT NOT NULL CHECK (role IN ('consumer', 'creator')),
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                is_active BOOLEAN DEFAULT TRUE
+            )
+        ''')
+    
+    def _create_videos_table(self, cursor):
+        """Create videos table"""
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS videos (
+                id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                description TEXT DEFAULT '',
+                creator_id TEXT NOT NULL,
+                file_path TEXT NOT NULL,
+                duration REAL DEFAULT 0.0,
+                file_size INTEGER DEFAULT 0,
+                format TEXT DEFAULT '',
+                upload_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                status TEXT DEFAULT 'ready' CHECK (status IN ('uploading', 'processing', 'ready', 'failed')),
+                view_count INTEGER DEFAULT 0,
+                like_count INTEGER DEFAULT 0,
+                dislike_count INTEGER DEFAULT 0,
+                genre TEXT DEFAULT '',
+                age_rating TEXT DEFAULT 'PG' CHECK (age_rating IN ('G', 'PG', '12+', '18+')),
+                sentiment_score REAL DEFAULT 0.0,
+                content_tags TEXT DEFAULT '[]',
+                FOREIGN KEY (creator_id) REFERENCES users (id) ON DELETE CASCADE
+            )
+        ''')
+    
+    def _create_comments_table(self, cursor):
+        """Create comments table"""
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS comments (
+                id TEXT PRIMARY KEY,
+                video_id TEXT NOT NULL,
+                user_id TEXT NOT NULL,
+                content TEXT NOT NULL,
+                sentiment_score REAL DEFAULT 0.0,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (video_id) REFERENCES videos (id) ON DELETE CASCADE,
+                FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE
+            )
+        ''')
+    
+    def _create_user_interactions_table(self, cursor):
+        """Create user interactions table"""
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS user_interactions (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                video_id TEXT NOT NULL,
+                interaction_type TEXT NOT NULL CHECK (interaction_type IN ('view', 'like', 'dislike', 'share')),
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE,
+                FOREIGN KEY (video_id) REFERENCES videos (id) ON DELETE CASCADE,
+                UNIQUE(user_id, video_id, interaction_type)
+            )
+        ''')
+    
+    def _create_saved_videos_table(self, cursor):
+        """Create saved videos table"""
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS saved_videos (
+                id TEXT PRIMARY KEY,
+                user_id TEXT NOT NULL,
+                video_id TEXT NOT NULL,
+                saved_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY (user_id) REFERENCES users (id) ON DELETE CASCADE,
+                FOREIGN KEY (video_id) REFERENCES videos (id) ON DELETE CASCADE,
+                UNIQUE(user_id, video_id)
+            )
+        ''')
+    
+    def _verify_tables(self, cursor):
+        """Verify that all required tables exist"""
+        required_tables = ['users', 'videos', 'comments', 'user_interactions', 'saved_videos']
         
-        try:
-            # Check if users table exists and has correct schema
-            cursor.execute("PRAGMA table_info(users)")
-            existing_columns = [row[1] for row in cursor.fetchall()]
-            
-            if 'password_hash' not in existing_columns:
-                cursor.execute("DROP TABLE IF EXISTS users")
-            
-            # Users table
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS users (
-                    id TEXT PRIMARY KEY,
-                    username TEXT UNIQUE NOT NULL,
-                    email TEXT UNIQUE NOT NULL,
-                    password_hash TEXT NOT NULL,
-                    role TEXT NOT NULL,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    is_active BOOLEAN DEFAULT TRUE
-                )
-            ''')
-            
-            # Videos table
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS videos (
-                    id TEXT PRIMARY KEY,
-                    title TEXT NOT NULL,
-                    description TEXT,
-                    creator_id TEXT NOT NULL,
-                    file_path TEXT NOT NULL,
-                    duration REAL DEFAULT 0.0,
-                    file_size INTEGER,
-                    format TEXT,
-                    upload_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    status TEXT DEFAULT 'ready',
-                    view_count INTEGER DEFAULT 0,
-                    like_count INTEGER DEFAULT 0,
-                    dislike_count INTEGER DEFAULT 0,
-                    genre TEXT DEFAULT '',
-                    age_rating TEXT DEFAULT 'PG',
-                    sentiment_score REAL DEFAULT 0.0,
-                    content_tags TEXT DEFAULT '[]',
-                    FOREIGN KEY (creator_id) REFERENCES users (id)
-                )
-            ''')
-            
-            # Comments table
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS comments (
-                    id TEXT PRIMARY KEY,
-                    video_id TEXT NOT NULL,
-                    user_id TEXT NOT NULL,
-                    content TEXT NOT NULL,
-                    sentiment_score REAL DEFAULT 0.0,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (video_id) REFERENCES videos (id),
-                    FOREIGN KEY (user_id) REFERENCES users (id)
-                )
-            ''')
-            
-            # User interactions (likes, views, saves, etc.)
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS user_interactions (
-                    id TEXT PRIMARY KEY,
-                    user_id TEXT NOT NULL,
-                    video_id TEXT NOT NULL,
-                    interaction_type TEXT NOT NULL,
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (user_id) REFERENCES users (id),
-                    FOREIGN KEY (video_id) REFERENCES videos (id),
-                    UNIQUE(user_id, video_id, interaction_type)
-                )
-            ''')
-            
-            # Saved videos table
-            cursor.execute('''
-                CREATE TABLE IF NOT EXISTS saved_videos (
-                    id TEXT PRIMARY KEY,
-                    user_id TEXT NOT NULL,
-                    video_id TEXT NOT NULL,
-                    saved_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                    FOREIGN KEY (user_id) REFERENCES users (id),
-                    FOREIGN KEY (video_id) REFERENCES videos (id),
-                    UNIQUE(user_id, video_id)
-                )
-            ''')
-            
-            conn.commit()
-        except Exception as e:
-            logging.error(f"Database initialization error: {e}")
-            conn.rollback()
-            raise
-        finally:
-            conn.close()
+        cursor.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        existing_tables = [row[0] for row in cursor.fetchall()]
+        
+        missing_tables = set(required_tables) - set(existing_tables)
+        if missing_tables:
+            raise Exception(f"Missing tables: {missing_tables}")
+        
+        logging.info(f"All required tables verified: {existing_tables}")
     
     def create_user(self, username: str, email: str, password: str, role: UserRole) -> Optional[str]:
-        """Create a new user account"""
+        """Create a new user account with enhanced error handling"""
+        if not all([username, email, password]) or not isinstance(role, UserRole):
+            logging.warning("Invalid user creation parameters")
+            return None
+        
         user_id = str(uuid.uuid4())
         password_hash = hashlib.sha256(password.encode()).hexdigest()
         
-        conn = self.get_connection()
-        cursor = conn.cursor()
-        
+        conn = None
         try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            
             cursor.execute("""
-                INSERT INTO users (id, username, email, password_hash, role)
-                VALUES (?, ?, ?, ?, ?)
-            """, (user_id, username, email, password_hash, role.value))
+                INSERT INTO users (id, username, email, password_hash, role, created_at, is_active)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (user_id, username, email, password_hash, role.value, datetime.now(), True))
+            
             conn.commit()
+            logging.info(f"User created successfully: {username}")
             return user_id
+            
         except sqlite3.IntegrityError as e:
-            logging.warning(f"User creation failed: {e}")
+            logging.warning(f"User creation failed - integrity error: {e}")
+            return None
+        except sqlite3.OperationalError as e:
+            logging.error(f"Database operational error during user creation: {e}")
             return None
         except Exception as e:
-            logging.error(f"Database error during user creation: {e}")
+            logging.error(f"Unexpected error during user creation: {e}")
             return None
         finally:
-            conn.close()
+            if conn:
+                conn.close()
     
     def authenticate_user(self, username: str, password: str) -> Optional[Dict]:
-        """Authenticate user login"""
+        """Authenticate user login with enhanced error handling"""
         if not username or not password:
             return None
-            
-        password_hash = hashlib.sha256(password.encode()).hexdigest()
         
-        conn = self.get_connection()
-        cursor = conn.cursor()
+        password_hash = hashlib.sha256(password.encode()).hexdigest()
+        conn = None
         
         try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            
             cursor.execute("""
-                SELECT id, username, email, role, is_active
+                SELECT id, username, email, role, is_active, created_at
                 FROM users
                 WHERE username = ? AND password_hash = ? AND is_active = TRUE
             """, (username, password_hash))
@@ -231,22 +319,72 @@ class DatabaseManager:
                     'username': result[1],
                     'email': result[2],
                     'role': result[3],
-                    'is_active': result[4]
+                    'is_active': result[4],
+                    'created_at': result[5]
                 }
+            return None
+            
+        except sqlite3.OperationalError as e:
+            logging.error(f"Database operational error during authentication: {e}")
             return None
         except Exception as e:
             logging.error(f"Authentication error: {e}")
             return None
         finally:
-            conn.close()
+            if conn:
+                conn.close()
     
-    def get_videos(self, filters: Dict = None) -> pd.DataFrame:
-        """Get videos with optional filters"""
-        conn = self.get_connection()
+    def add_video(self, title: str, description: str, creator_id: str, file_path: str, 
+                  genre: str = '', age_rating: str = 'PG') -> Optional[str]:
+        """Add a new video to the database"""
+        if not all([title, creator_id, file_path]):
+            logging.warning("Invalid video creation parameters")
+            return None
+        
+        video_id = str(uuid.uuid4())
+        conn = None
         
         try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            
+            # Get file info
+            file_size = os.path.getsize(file_path) if os.path.exists(file_path) else 0
+            file_format = os.path.splitext(file_path)[1].lower()
+            
+            cursor.execute("""
+                INSERT INTO videos (id, title, description, creator_id, file_path, 
+                                  file_size, format, genre, age_rating, status, upload_date)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (video_id, title, description, creator_id, file_path, 
+                  file_size, file_format, genre, age_rating, 'ready', datetime.now()))
+            
+            conn.commit()
+            logging.info(f"Video added successfully: {title}")
+            return video_id
+            
+        except sqlite3.IntegrityError as e:
+            logging.warning(f"Video creation failed - integrity error: {e}")
+            return None
+        except Exception as e:
+            logging.error(f"Error adding video: {e}")
+            return None
+        finally:
+            if conn:
+                conn.close()
+    
+    def get_videos(self, filters: Dict = None) -> pd.DataFrame:
+        """Get videos with optional filters and enhanced error handling"""
+        conn = None
+        
+        try:
+            conn = self.get_connection()
+            
             query = """
-                SELECT v.*, u.username as creator_name
+                SELECT v.id, v.title, v.description, v.creator_id, v.file_path, v.duration,
+                       v.file_size, v.format, v.upload_date, v.status, v.view_count,
+                       v.like_count, v.dislike_count, v.genre, v.age_rating,
+                       v.sentiment_score, v.content_tags, u.username as creator_name
                 FROM videos v
                 JOIN users u ON v.creator_id = u.id
                 WHERE v.status = 'ready'
@@ -270,24 +408,34 @@ class DatabaseManager:
             query += " ORDER BY v.upload_date DESC"
             
             df = pd.read_sql(query, conn, params=params)
+            logging.info(f"Retrieved {len(df)} videos")
             return df
+            
+        except sqlite3.OperationalError as e:
+            logging.error(f"Database operational error fetching videos: {e}")
+            return pd.DataFrame()
         except Exception as e:
             logging.error(f"Error fetching videos: {e}")
             return pd.DataFrame()
         finally:
-            conn.close()
+            if conn:
+                conn.close()
     
     def get_video_by_id(self, video_id: str) -> Optional[Dict]:
-        """Get a specific video by ID"""
+        """Get a specific video by ID with enhanced error handling"""
         if not video_id:
             return None
-            
-        conn = self.get_connection()
-        cursor = conn.cursor()
         
+        conn = None
         try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            
             cursor.execute("""
-                SELECT v.*, u.username as creator_name
+                SELECT v.id, v.title, v.description, v.creator_id, v.file_path, v.duration,
+                       v.file_size, v.format, v.upload_date, v.status, v.view_count,
+                       v.like_count, v.dislike_count, v.genre, v.age_rating,
+                       v.sentiment_score, v.content_tags, u.username as creator_name
                 FROM videos v
                 JOIN users u ON v.creator_id = u.id
                 WHERE v.id = ? AND v.status = 'ready'
@@ -302,22 +450,32 @@ class DatabaseManager:
                           'sentiment_score', 'content_tags', 'creator_name']
                 return dict(zip(columns, result))
             return None
+            
+        except sqlite3.OperationalError as e:
+            logging.error(f"Database operational error fetching video {video_id}: {e}")
+            return None
         except Exception as e:
             logging.error(f"Error fetching video {video_id}: {e}")
             return None
         finally:
-            conn.close()
+            if conn:
+                conn.close()
     
     def get_user_saved_videos(self, user_id: str) -> pd.DataFrame:
-        """Get user's saved videos"""
+        """Get user's saved videos with enhanced error handling"""
         if not user_id:
             return pd.DataFrame()
-            
-        conn = self.get_connection()
         
+        conn = None
         try:
+            conn = self.get_connection()
+            
             query = """
-                SELECT v.*, u.username as creator_name, sv.saved_at
+                SELECT v.id, v.title, v.description, v.creator_id, v.file_path, v.duration,
+                       v.file_size, v.format, v.upload_date, v.status, v.view_count,
+                       v.like_count, v.dislike_count, v.genre, v.age_rating,
+                       v.sentiment_score, v.content_tags, u.username as creator_name, 
+                       sv.saved_at
                 FROM saved_videos sv
                 JOIN videos v ON sv.video_id = v.id
                 JOIN users u ON v.creator_id = u.id
@@ -327,21 +485,27 @@ class DatabaseManager:
             
             df = pd.read_sql(query, conn, params=[user_id])
             return df
+            
+        except sqlite3.OperationalError as e:
+            logging.error(f"Database operational error fetching saved videos: {e}")
+            return pd.DataFrame()
         except Exception as e:
             logging.error(f"Error fetching saved videos: {e}")
             return pd.DataFrame()
         finally:
-            conn.close()
+            if conn:
+                conn.close()
     
     def check_user_interaction(self, user_id: str, video_id: str, interaction_type: str) -> bool:
         """Check if user has already performed this interaction"""
         if not all([user_id, video_id, interaction_type]):
             return False
-            
-        conn = self.get_connection()
-        cursor = conn.cursor()
         
+        conn = None
         try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            
             cursor.execute("""
                 SELECT COUNT(*) FROM user_interactions
                 WHERE user_id = ? AND video_id = ? AND interaction_type = ?
@@ -349,21 +513,24 @@ class DatabaseManager:
             
             result = cursor.fetchone()[0] > 0
             return result
+            
         except Exception as e:
             logging.error(f"Error checking user interaction: {e}")
             return False
         finally:
-            conn.close()
+            if conn:
+                conn.close()
     
     def check_video_saved(self, user_id: str, video_id: str) -> bool:
         """Check if video is saved by user"""
         if not all([user_id, video_id]):
             return False
-            
-        conn = self.get_connection()
-        cursor = conn.cursor()
         
+        conn = None
         try:
+            conn = self.get_connection()
+            cursor = conn.cursor()
+            
             cursor.execute("""
                 SELECT COUNT(*) FROM saved_videos
                 WHERE user_id = ? AND video_id = ?
@@ -371,15 +538,143 @@ class DatabaseManager:
             
             result = cursor.fetchone()[0] > 0
             return result
+            
         except Exception as e:
             logging.error(f"Error checking saved video: {e}")
             return False
         finally:
-            conn.close()
+            if conn:
+                conn.close()
 
-# Advanced Features Implementation
+# Enhanced Analytics Engine
+class AnalyticsEngine:
+    def __init__(self, db_manager: DatabaseManager):
+        self.db = db_manager
+    
+    def track_interaction(self, user_id: str, video_id: str, interaction_type: str):
+        """Track user interactions for analytics with better error handling"""
+        if not all([user_id, video_id, interaction_type]):
+            logging.warning(f"Invalid interaction parameters: {user_id}, {video_id}, {interaction_type}")
+            return
+        
+        conn = None
+        try:
+            conn = self.db.get_connection()
+            cursor = conn.cursor()
+            
+            interaction_id = str(uuid.uuid4())
+            cursor.execute("""
+                INSERT OR IGNORE INTO user_interactions (id, user_id, video_id, interaction_type, timestamp)
+                VALUES (?, ?, ?, ?, ?)
+            """, (interaction_id, user_id, video_id, interaction_type, datetime.now()))
+            
+            # Update video metrics
+            if interaction_type == 'view':
+                cursor.execute("UPDATE videos SET view_count = view_count + 1 WHERE id = ?", (video_id,))
+            elif interaction_type == 'like':
+                cursor.execute("UPDATE videos SET like_count = like_count + 1 WHERE id = ?", (video_id,))
+            elif interaction_type == 'dislike':
+                cursor.execute("UPDATE videos SET dislike_count = dislike_count + 1 WHERE id = ?", (video_id,))
+            
+            conn.commit()
+            
+        except sqlite3.IntegrityError:
+            # Interaction already exists
+            logging.info(f"Interaction already exists: {user_id}, {video_id}, {interaction_type}")
+        except Exception as e:
+            logging.error(f"Error tracking interaction: {e}")
+            if conn:
+                conn.rollback()
+        finally:
+            if conn:
+                conn.close()
+    
+    def remove_interaction(self, user_id: str, video_id: str, interaction_type: str):
+        """Remove user interaction (for unlike, etc.)"""
+        if not all([user_id, video_id, interaction_type]):
+            return
+        
+        conn = None
+        try:
+            conn = self.db.get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                DELETE FROM user_interactions
+                WHERE user_id = ? AND video_id = ? AND interaction_type = ?
+            """, (user_id, video_id, interaction_type))
+            
+            # Update video metrics
+            if interaction_type == 'like':
+                cursor.execute("UPDATE videos SET like_count = CASE WHEN like_count > 0 THEN like_count - 1 ELSE 0 END WHERE id = ?", (video_id,))
+            elif interaction_type == 'dislike':
+                cursor.execute("UPDATE videos SET dislike_count = CASE WHEN dislike_count > 0 THEN dislike_count - 1 ELSE 0 END WHERE id = ?", (video_id,))
+            
+            conn.commit()
+            
+        except Exception as e:
+            logging.error(f"Error removing interaction: {e}")
+            if conn:
+                conn.rollback()
+        finally:
+            if conn:
+                conn.close()
+    
+    def save_video(self, user_id: str, video_id: str):
+        """Save video for user"""
+        if not all([user_id, video_id]):
+            return False
+        
+        conn = None
+        try:
+            conn = self.db.get_connection()
+            cursor = conn.cursor()
+            
+            save_id = str(uuid.uuid4())
+            cursor.execute("""
+                INSERT INTO saved_videos (id, user_id, video_id, saved_at)
+                VALUES (?, ?, ?, ?)
+            """, (save_id, user_id, video_id, datetime.now()))
+            
+            conn.commit()
+            return True
+            
+        except sqlite3.IntegrityError:
+            logging.info(f"Video already saved: {user_id}, {video_id}")
+            return False
+        except Exception as e:
+            logging.error(f"Error saving video: {e}")
+            return False
+        finally:
+            if conn:
+                conn.close()
+    
+    def unsave_video(self, user_id: str, video_id: str):
+        """Remove video from saved list"""
+        if not all([user_id, video_id]):
+            return
+        
+        conn = None
+        try:
+            conn = self.db.get_connection()
+            cursor = conn.cursor()
+            
+            cursor.execute("""
+                DELETE FROM saved_videos
+                WHERE user_id = ? AND video_id = ?
+            """, (user_id, video_id))
+            
+            conn.commit()
+            
+        except Exception as e:
+            logging.error(f"Error unsaving video: {e}")
+            if conn:
+                conn.rollback()
+        finally:
+            if conn:
+                conn.close()
 
-# 1. Content Analysis and Recommendation Engine
+# Enhanced Recommendation Engine  
 class RecommendationEngine:
     def __init__(self, db_manager: DatabaseManager):
         self.db = db_manager
@@ -388,10 +683,11 @@ class RecommendationEngine:
         """Get personalized video recommendations based on user behavior"""
         if not user_id:
             return []
-            
-        conn = self.db.get_connection()
         
+        conn = None
         try:
+            conn = self.db.get_connection()
+            
             # Get user's interaction history
             user_history = pd.read_sql("""
                 SELECT v.genre, v.sentiment_score, COUNT(*) as interaction_count
@@ -405,7 +701,10 @@ class RecommendationEngine:
             if user_history.empty:
                 # Return trending videos for new users
                 trending = pd.read_sql("""
-                    SELECT v.*, u.username as creator_name
+                    SELECT v.id, v.title, v.description, v.creator_id, v.file_path, v.duration,
+                           v.file_size, v.format, v.upload_date, v.status, v.view_count,
+                           v.like_count, v.dislike_count, v.genre, v.age_rating,
+                           v.sentiment_score, v.content_tags, u.username as creator_name
                     FROM videos v
                     JOIN users u ON v.creator_id = u.id
                     WHERE v.status = 'ready'
@@ -418,142 +717,36 @@ class RecommendationEngine:
                 avg_sentiment = user_history['sentiment_score'].mean()
                 
                 if preferred_genres:
-                    genre_filter = "'" + "','".join(preferred_genres) + "'"
+                    placeholders = ','.join(['?' for _ in preferred_genres])
                     trending = pd.read_sql(f"""
-                        SELECT v.*, u.username as creator_name,
+                        SELECT v.id, v.title, v.description, v.creator_id, v.file_path, v.duration,
+                               v.file_size, v.format, v.upload_date, v.status, v.view_count,
+                               v.like_count, v.dislike_count, v.genre, v.age_rating,
+                               v.sentiment_score, v.content_tags, u.username as creator_name,
                                ABS(v.sentiment_score - ?) as sentiment_diff
                         FROM videos v
                         JOIN users u ON v.creator_id = u.id
-                        WHERE v.status = 'ready' AND v.genre IN ({genre_filter})
+                        WHERE v.status = 'ready' AND v.genre IN ({placeholders})
                         ORDER BY sentiment_diff ASC, v.view_count DESC
                         LIMIT ?
-                    """, conn, params=[avg_sentiment, limit])
+                    """, conn, params=[avg_sentiment] + preferred_genres + [limit])
                 else:
                     trending = pd.DataFrame()
             
             return trending.to_dict('records') if not trending.empty else []
+            
         except Exception as e:
             logging.error(f"Error getting recommendations: {e}")
             return []
         finally:
-            conn.close()
+            if conn:
+                conn.close()
 
-# 2. Real-time Analytics Dashboard
-class AnalyticsEngine:
-    def __init__(self, db_manager: DatabaseManager):
-        self.db = db_manager
-    
-    def track_interaction(self, user_id: str, video_id: str, interaction_type: str):
-        """Track user interactions for analytics"""
-        if not all([user_id, video_id, interaction_type]):
-            return
-            
-        conn = self.db.get_connection()
-        cursor = conn.cursor()
-        
-        try:
-            interaction_id = str(uuid.uuid4())
-            cursor.execute("""
-                INSERT OR IGNORE INTO user_interactions (id, user_id, video_id, interaction_type)
-                VALUES (?, ?, ?, ?)
-            """, (interaction_id, user_id, video_id, interaction_type))
-            
-            # Update video metrics
-            if interaction_type == 'view':
-                cursor.execute("UPDATE videos SET view_count = view_count + 1 WHERE id = ?", (video_id,))
-            elif interaction_type == 'like':
-                cursor.execute("UPDATE videos SET like_count = like_count + 1 WHERE id = ?", (video_id,))
-            elif interaction_type == 'dislike':
-                cursor.execute("UPDATE videos SET dislike_count = dislike_count + 1 WHERE id = ?", (video_id,))
-            
-            conn.commit()
-        except sqlite3.IntegrityError:
-            # Interaction already exists
-            pass
-        except Exception as e:
-            logging.error(f"Error tracking interaction: {e}")
-            conn.rollback()
-        finally:
-            conn.close()
-    
-    def remove_interaction(self, user_id: str, video_id: str, interaction_type: str):
-        """Remove user interaction (for unlike, etc.)"""
-        if not all([user_id, video_id, interaction_type]):
-            return
-            
-        conn = self.db.get_connection()
-        cursor = conn.cursor()
-        
-        try:
-            cursor.execute("""
-                DELETE FROM user_interactions
-                WHERE user_id = ? AND video_id = ? AND interaction_type = ?
-            """, (user_id, video_id, interaction_type))
-            
-            # Update video metrics
-            if interaction_type == 'like':
-                cursor.execute("UPDATE videos SET like_count = CASE WHEN like_count > 0 THEN like_count - 1 ELSE 0 END WHERE id = ?", (video_id,))
-            elif interaction_type == 'dislike':
-                cursor.execute("UPDATE videos SET dislike_count = CASE WHEN dislike_count > 0 THEN dislike_count - 1 ELSE 0 END WHERE id = ?", (video_id,))
-            
-            conn.commit()
-        except Exception as e:
-            logging.error(f"Error removing interaction: {e}")
-            conn.rollback()
-        finally:
-            conn.close()
-    
-    def save_video(self, user_id: str, video_id: str):
-        """Save video for user"""
-        if not all([user_id, video_id]):
-            return False
-            
-        conn = self.db.get_connection()
-        cursor = conn.cursor()
-        
-        try:
-            save_id = str(uuid.uuid4())
-            cursor.execute("""
-                INSERT INTO saved_videos (id, user_id, video_id)
-                VALUES (?, ?, ?)
-            """, (save_id, user_id, video_id))
-            conn.commit()
-            return True
-        except sqlite3.IntegrityError:
-            return False
-        except Exception as e:
-            logging.error(f"Error saving video: {e}")
-            return False
-        finally:
-            conn.close()
-    
-    def unsave_video(self, user_id: str, video_id: str):
-        """Remove video from saved list"""
-        if not all([user_id, video_id]):
-            return
-            
-        conn = self.db.get_connection()
-        cursor = conn.cursor()
-        
-        try:
-            cursor.execute("""
-                DELETE FROM saved_videos
-                WHERE user_id = ? AND video_id = ?
-            """, (user_id, video_id))
-            
-            conn.commit()
-        except Exception as e:
-            logging.error(f"Error unsaving video: {e}")
-            conn.rollback()
-        finally:
-            conn.close()
-
-# 3. Sentiment Analysis for Comments
 class SentimentAnalyzer:
     def __init__(self):
         # Simple rule-based sentiment analysis for demo
-        self.positive_words = ['good', 'great', 'awesome', 'love', 'amazing', 'excellent', 'fantastic']
-        self.negative_words = ['bad', 'terrible', 'hate', 'awful', 'horrible', 'worst', 'boring']
+        self.positive_words = ['good', 'great', 'awesome', 'love', 'amazing', 'excellent', 'fantastic', 'wonderful', 'perfect', 'brilliant']
+        self.negative_words = ['bad', 'terrible', 'hate', 'awful', 'horrible', 'worst', 'boring', 'stupid', 'annoying', 'disappointing']
     
     def analyze_sentiment(self, text: str) -> float:
         """Analyze sentiment of text (-1 to 1 scale)"""
@@ -572,140 +765,248 @@ class SentimentAnalyzer:
         sentiment = (positive_count - negative_count) / max(total_words, 1)
         return max(-1, min(1, sentiment * 5))  # Scale and clamp
 
+# Initialize components with better error handling
+def initialize_components():
+    """Initialize all database and engine components"""
+    try:
+        # Ensure uploads directory exists
+        if not os.path.exists(Config.UPLOAD_FOLDER):
+            os.makedirs(Config.UPLOAD_FOLDER)
+        
+        db_manager = DatabaseManager(Config.DATABASE_PATH)
+        recommendation_engine = RecommendationEngine(db_manager)
+        analytics_engine = AnalyticsEngine(db_manager)
+        sentiment_analyzer = SentimentAnalyzer()
+        
+        logging.info("All components initialized successfully")
+        return db_manager, recommendation_engine, analytics_engine, sentiment_analyzer
+        
+    except Exception as e:
+        logging.error(f"Failed to initialize components: {e}")
+        raise
+
+def create_video_serving_route(app):
+    
+    @app.server.route('/uploads/<filename>')
+    def uploaded_file(filename):
+        uploads_dir = os.path.join(os.getcwd(), 'uploads')
+        return send_from_directory(uploads_dir, filename)
+
+
 # Initialize components
-db_manager = DatabaseManager(Config.DATABASE_PATH)
-recommendation_engine = RecommendationEngine(db_manager)
-analytics_engine = AnalyticsEngine(db_manager)
-sentiment_analyzer = SentimentAnalyzer()
+db_manager, recommendation_engine, analytics_engine, sentiment_analyzer = initialize_components()
 
 # Create directories
 os.makedirs(Config.UPLOAD_FOLDER, exist_ok=True)
 
 # Initialize Dash app
-app = dash.Dash(__name__, suppress_callback_exceptions=True)
-
-# Add this line to expose the server for gunicorn
+app = dash.Dash(__name__, suppress_callback_exceptions=True, external_stylesheets=[dbc.themes.BOOTSTRAP])
 server = app.server
+
+# ADD THIS LINE:
+create_video_serving_route(app)
 
 # Layout Components
 def create_auth_layout():
     """Create authentication layout"""
     return html.Div([
         html.Div([
-            html.H1("ShareTok Platform", className="auth-title"),
+            html.H1("ShareTok Platform", style={
+                'textAlign': 'center',
+                'color': '#333',
+                'marginBottom': '30px',
+                'fontFamily': 'Arial, sans-serif'
+            }),
             
-            # Login/Register toggle
-            dcc.Tabs(id="auth-tabs", value="login", children=[
-                dcc.Tab(label="Login", value="login", children=[
-                    html.Div([
-                        dcc.Input(id="login-username", type="text", placeholder="Username", className="auth-input"),
-                        dcc.Input(id="login-password", type="password", placeholder="Password", className="auth-input"),
-                        html.Button("Login", id="login-btn", className="auth-button"),
-                        html.Div(id="login-message", className="auth-message")
-                    ], className="auth-form")
-                ]),
-                
-                dcc.Tab(label="Register", value="register", children=[
-                    html.Div([
-                        dcc.Input(id="reg-username", type="text", placeholder="Username", className="auth-input"),
-                        dcc.Input(id="reg-email", type="email", placeholder="Email", className="auth-input"),
-                        dcc.Input(id="reg-password", type="password", placeholder="Password", className="auth-input"),
-                        dcc.Dropdown(
-                            id="reg-role",
-                            options=[
-                                {'label': 'Consumer (Watch videos)', 'value': 'consumer'},
-                                {'label': 'Creator (Upload videos)', 'value': 'creator'}
-                            ],
-                            placeholder="Select Role",
-                            className="auth-dropdown"
-                        ),
-                        html.Button("Register", id="register-btn", className="auth-button"),
-                        html.Div(id="register-message", className="auth-message")
-                    ], className="auth-form")
-                ])
-            ])
-        ], className="auth-container")
-    ])
+            dcc.Tabs(
+                id="auth-tabs", 
+                value="login",
+                style={'marginBottom': '20px'},
+                children=[
+                    dcc.Tab(
+                        label="Login", 
+                        value="login",
+                        style={'padding': '12px 24px', 'border': '1px solid #ddd'}
+                    ),
+                    dcc.Tab(
+                        label="Register", 
+                        value="register",
+                        style={'padding': '12px 24px', 'border': '1px solid #ddd'}
+                    )
+                ]
+            ),
+            
+            html.Div(id='auth-content')
+        ], style={
+            'width': '400px',
+            'margin': '50px auto',
+            'padding': '40px',
+            'border': '1px solid #ddd',
+            'borderRadius': '8px',
+            'backgroundColor': 'white',
+            'boxShadow': '0 4px 6px rgba(0, 0, 0, 0.1)'
+        })
+    ], style={
+        'backgroundColor': '#f5f5f5',
+        'minHeight': '100vh',
+        'padding': '20px'
+    })
 
 def create_main_layout(user_data):
-    """Create main application layout based on user role"""
+    """Create main application layout"""
+    
+    # Define tabs based on user role
+    if user_data['role'] == UserRole.CREATOR.value:
+        tab_children = [
+            dcc.Tab(label="Browse", value="browse", id="browse-tab"),
+            dcc.Tab(label="Upload", value="upload", id="upload-tab"),
+            dcc.Tab(label="My Videos", value="my-videos", id="my-videos-tab"),
+            dcc.Tab(label="Analytics", value="creator-analytics", id="creator-analytics-tab")
+        ]
+    else:
+        tab_children = [
+            dcc.Tab(label="Browse", value="browse", id="browse-tab"),
+            dcc.Tab(label="Saved", value="saved", id="saved-tab")
+        ]
+
     return html.Div([
         # Header
         html.Div([
-            html.H1("ScaleVid Platform", className="header-title"),
             html.Div([
-                html.Span(f"Welcome, {user_data['username']} ({user_data['role'].title()})", className="user-info"),
-                html.Button("Logout", id="logout-btn", className="logout-button")
-            ], className="header-controls")
-        ], className="header"),
+                html.H1("ShareTok Platform", style={
+                    'margin': '0',
+                    'color': 'white',
+                    'fontSize': '24px'
+                }),
+                html.Div([
+                    html.Span(f"Welcome, {user_data['username']} ({user_data['role'].title()})", 
+                             style={'color': 'white', 'marginRight': '20px'}),
+                    html.Button("Logout", id="logout-btn", style={
+                        'backgroundColor': '#dc3545',
+                        'color': 'white',
+                        'border': 'none',
+                        'padding': '8px 16px',
+                        'borderRadius': '4px',
+                        'cursor': 'pointer'
+                    })
+                ])
+            ], style={
+                'display': 'flex',
+                'justifyContent': 'space-between',
+                'alignItems': 'center'
+            })
+        ], style={
+            'backgroundColor': '#007bff',
+            'padding': '15px 30px',
+            'marginBottom': '0'
+        }),
         
-        # Navigation
-        html.Div([
-            dcc.Tabs(id="main-tabs", value="browse", children=create_nav_tabs(user_data['role']))
-        ]),
+        # Navigation Tabs
+        dcc.Tabs(
+            id="main-tabs",
+            value="browse",
+            children=tab_children,
+            style={'marginBottom': '20px'}
+        ),
         
-        # Content
-        html.Div(id="main-content", className="main-content"),
+        # Main Content Area
+        html.Div(id="main-content", style={'padding': '0 30px 30px 30px'}),
         
-        # Stores
-        dcc.Store(id="user-store", data=user_data),
-        dcc.Store(id="upload-status-store", data={}),
-        dcc.Store(id="current-video-store", data={}),
-        dcc.Store(id="navigation-store", data={'current_page': 'browse'}),
-        dcc.Interval(id="interval-component", interval=10000, n_intervals=0)
+        # Store components
+        dcc.Store(id='user-store', data=user_data),
+        dcc.Store(id='current-video-store', data={}),
+        dcc.Store(id='navigation-store', data={'current_page': 'browse'}),
+        dcc.Store(id='upload-status-store', data={}),
+        
+        # Interval component for periodic updates
+        dcc.Interval(
+            id='interval-component',
+            interval=5*1000,  # 5 seconds
+            n_intervals=0
+        )
     ])
 
-def create_nav_tabs(user_role):
-    """Create navigation tabs based on user role"""
-    tabs = [
-        dcc.Tab(label="Browse Videos", value="browse")
-    ]
-    
-    if user_role == UserRole.CONSUMER.value:
-        tabs.extend([
-            dcc.Tab(label="Saved Videos", value="saved")
-        ])
-    
-    if user_role == UserRole.CREATOR.value:
-        tabs.extend([
-            dcc.Tab(label="My Videos", value="my-videos"),
-            dcc.Tab(label="Upload", value="upload"),
-            dcc.Tab(label="Analytics", value="creator-analytics")
-        ])
-    
-    return tabs
 
-def create_video_grid(videos, user_data=None):
-    """Create video grid display"""
+def create_video_grid(videos, user_data):
+    """Create video grid layout"""
     if not videos:
-        return html.Div("No videos found.", className="no-videos")
+        return html.Div("No videos available.", style={
+            'textAlign': 'center',
+            'padding': '40px',
+            'color': '#666'
+        })
     
     video_cards = []
     for video in videos:
         try:
             card = html.Div([
                 html.Div([
-                    html.Img(src="/assets/video-thumbnail.png", className="video-thumbnail"),
-                    html.Div(f"{video.get('duration', 0):.0f}s", className="video-duration")
-                ], className="thumbnail-container"),
+                    html.Video(
+                        src=f"/uploads/{os.path.basename(video.get('file_path', ''))}",
+                        style={
+                            'width': '100%',
+                            'height': '160px',
+                            'objectFit': 'cover',
+                            'backgroundColor': '#000'
+                        },
+                        controls=False,
+                        preload='metadata'
+                    )
+                ], style={'position': 'relative', 'overflow': 'hidden'}),
                 
                 html.Div([
-                    html.H4(video.get('title', 'No Title'), className="video-title"),
-                    html.P(f"By {video.get('creator_name', 'Unknown')}", className="video-creator"),
+                    html.H4(video.get('title', 'No Title'), style={
+                        'margin': '8px 0 4px 0',
+                        'fontSize': '16px',
+                        'fontWeight': 'bold'
+                    }),
+                    html.P(f"By {video.get('creator_name', 'Unknown')}", style={
+                        'margin': '0 0 8px 0',
+                        'color': '#666',
+                        'fontSize': '14px'
+                    }),
                     html.Div([
-                        html.Span(f"👁 {video.get('view_count', 0):,}", className="video-stat"),
-                        html.Span(f"👍 {video.get('like_count', 0):,}", className="video-stat"),
-                        html.Span(f"🏷 {video.get('genre', 'Unknown')}", className="video-genre")
-                    ], className="video-stats"),
+                        html.Span(f"👁 {video.get('view_count', 0):,}", style={
+                            'marginRight': '12px',
+                            'fontSize': '12px',
+                            'color': '#666'
+                        }),
+                        html.Span(f"👍 {video.get('like_count', 0):,}", style={
+                            'marginRight': '12px',
+                            'fontSize': '12px',
+                            'color': '#666'
+                        }),
+                        html.Span(f"🏷 {video.get('genre', 'Unknown')}", style={
+                            'fontSize': '12px',
+                            'color': '#007bff',
+                            'backgroundColor': '#e7f3ff',
+                            'padding': '2px 6px',
+                            'borderRadius': '4px'
+                        })
+                    ], style={'marginBottom': '8px'}),
                     html.P(
                         (video.get('description', '')[:100] + "..." 
                          if len(video.get('description', '')) > 100 
                          else video.get('description', '')), 
-                        className="video-description"
+                        style={
+                            'margin': '0',
+                            'fontSize': '12px',
+                            'color': '#666',
+                            'lineHeight': '1.4'
+                        }
                     )
-                ], className="video-info")
+                ], style={'padding': '12px'})
             ], 
-            className="video-card", 
+            style={
+                'border': '1px solid #ddd',
+                'borderRadius': '8px',
+                'backgroundColor': 'white',
+                'cursor': 'pointer',
+                'transition': 'transform 0.2s',
+                'margin': '10px',
+                'width': '280px',
+                'boxShadow': '0 2px 4px rgba(0,0,0,0.1)'
+            }, 
             id={'type': 'video-card', 'index': video.get('id', '')},
             n_clicks=0)
             
@@ -714,14 +1015,33 @@ def create_video_grid(videos, user_data=None):
             logging.error(f"Error creating video card: {e}")
             continue
     
-    return html.Div(video_cards, className="video-grid")
+    return html.Div(video_cards, style={
+        'display': 'flex',
+        'flexWrap': 'wrap',
+        'justifyContent': 'flex-start',
+        'padding': '10px'
+    })
 
 def create_video_player_layout(video_data, user_data):
     """Create video player layout"""
     if not video_data:
         return html.Div([
-            html.Div("Video not found.", className="error-message"),
-            html.Button("← Back to Browse", id="back-to-browse-btn", className="back-button")
+            html.Div("Video not found.", style={
+                'textAlign': 'center',
+                'padding': '40px',
+                'color': '#dc3545',
+                'fontSize': '18px'
+            }),
+            html.Button("← Back to Browse", 
+                       id="back-to-browse-btn", 
+                       style={
+                           'backgroundColor': '#6c757d',
+                           'color': 'white',
+                           'border': 'none',
+                           'padding': '10px 20px',
+                           'borderRadius': '4px',
+                           'cursor': 'pointer'
+                       })
         ])
     
     try:
@@ -731,7 +1051,17 @@ def create_video_player_layout(video_data, user_data):
         is_saved = db_manager.check_video_saved(user_data['id'], video_data['id'])
         
         return html.Div([
-            html.Button("← Back to Browse", id="back-to-browse-btn", className="back-button"),
+            html.Button("← Back to Browse", 
+                       id="back-to-browse-btn", 
+                       style={
+                           'backgroundColor': '#6c757d',
+                           'color': 'white',
+                           'border': 'none',
+                           'padding': '10px 20px',
+                           'borderRadius': '4px',
+                           'cursor': 'pointer',
+                           'marginBottom': '20px'
+                       }),
             
             html.Div([
                 # Video Player Section
@@ -739,76 +1069,349 @@ def create_video_player_layout(video_data, user_data):
                     html.Video(
                         src=f"/uploads/{os.path.basename(video_data.get('file_path', ''))}",
                         controls=True,
-                        className="video-player",
-                        style={'width': '100%', 'maxHeight': '500px'}
+                        style={
+                            'width': '100%',
+                            'maxHeight': '500px',
+                            'backgroundColor': '#000',
+                            'borderRadius': '8px'
+                        }
                     ),
                     
                     html.Div([
-                        html.H2(video_data.get('title', 'No Title'), className="video-player-title"),
+                        html.H2(video_data.get('title', 'No Title'), style={
+                            'margin': '20px 0 10px 0',
+                            'fontSize': '24px',
+                            'fontWeight': 'bold'
+                        }),
                         html.P(f"By {video_data.get('creator_name', 'Unknown')} • {video_data.get('view_count', 0):,} views • {video_data.get('genre', 'Unknown')}", 
-                              className="video-player-info"),
+                              style={
+                                  'color': '#666',
+                                  'margin': '0 0 20px 0'
+                              }),
                         
                         # Interaction buttons
                         html.Div([
                             html.Button(
                                 f"👍 {video_data.get('like_count', 0):,}",
                                 id="like-btn",
-                                className=f"interaction-btn {'liked' if is_liked else ''}",
+                                style={
+                                    'backgroundColor': '#28a745' if is_liked else '#f8f9fa',
+                                    'color': 'white' if is_liked else '#333',
+                                    'border': '1px solid #ddd',
+                                    'padding': '8px 16px',
+                                    'borderRadius': '4px',
+                                    'cursor': 'pointer',
+                                    'marginRight': '10px'
+                                },
                                 **{'data-video-id': video_data['id']}
                             ),
                             html.Button(
                                 f"👎 {video_data.get('dislike_count', 0):,}",
                                 id="dislike-btn",
-                                className=f"interaction-btn {'disliked' if is_disliked else ''}",
+                                style={
+                                    'backgroundColor': '#dc3545' if is_disliked else '#f8f9fa',
+                                    'color': 'white' if is_disliked else '#333',
+                                    'border': '1px solid #ddd',
+                                    'padding': '8px 16px',
+                                    'borderRadius': '4px',
+                                    'cursor': 'pointer',
+                                    'marginRight': '10px'
+                                },
                                 **{'data-video-id': video_data['id']}
                             ),
                             html.Button(
                                 "💾 Save" if not is_saved else "✅ Saved",
                                 id="save-btn",
-                                className=f"interaction-btn {'saved' if is_saved else ''}",
+                                style={
+                                    'backgroundColor': '#17a2b8' if is_saved else '#f8f9fa',
+                                    'color': 'white' if is_saved else '#333',
+                                    'border': '1px solid #ddd',
+                                    'padding': '8px 16px',
+                                    'borderRadius': '4px',
+                                    'cursor': 'pointer'
+                                },
                                 **{'data-video-id': video_data['id']}
                             )
-                        ], className="interaction-buttons"),
+                        ], style={'marginBottom': '20px'}),
                         
                         html.Div([
-                            html.H4("Description"),
-                            html.P(video_data.get('description', 'No description available'))
-                        ], className="video-description-section")
-                    ], className="video-player-details")
-                ], className="video-player-container"),
+                            html.H4("Description", style={'margin': '0 0 10px 0'}),
+                            html.P(video_data.get('description', 'No description available'), style={
+                                'lineHeight': '1.6',
+                                'color': '#333'
+                            })
+                        ], style={
+                            'backgroundColor': '#f8f9fa',
+                            'padding': '15px',
+                            'borderRadius': '8px',
+                            'border': '1px solid #ddd'
+                        })
+                    ])
+                ], style={'flex': '2', 'marginRight': '20px'}),
                 
                 # Comments Section
                 html.Div([
-                    html.H4("Comments"),
+                    html.H4("Comments", style={'margin': '0 0 15px 0'}),
                     html.Div([
                         dcc.Textarea(
                             id="comment-input",
                             placeholder="Add a comment...",
-                            className="comment-input"
+                            style={
+                                'width': '100%',
+                                'height': '80px',
+                                'padding': '10px',
+                                'border': '1px solid #ddd',
+                                'borderRadius': '4px',
+                                'resize': 'vertical'
+                            }
                         ),
-                        html.Button("Post Comment", id="post-comment-btn", className="post-comment-btn")
-                    ], className="comment-form"),
+                        html.Button("Post Comment", id="post-comment-btn", style={
+                            'backgroundColor': '#007bff',
+                            'color': 'white',
+                            'border': 'none',
+                            'padding': '8px 16px',
+                            'borderRadius': '4px',
+                            'cursor': 'pointer',
+                            'marginTop': '10px'
+                        })
+                    ]),
                     
-                    html.Div(id="comments-list", className="comments-list")
-                ], className="comments-section")
-            ], className="video-page-content")
+                    html.Div(id="comments-list", style={'marginTop': '20px'})
+                ], style={'flex': '1'})
+            ], style={'display': 'flex'})
         ])
     except Exception as e:
         logging.error(f"Error creating video player layout: {e}")
         return html.Div([
-            html.Div("Error loading video player.", className="error-message"),
-            html.Button("← Back to Browse", id="back-to-browse-btn", className="back-button")
+            html.Div("Error loading video player.", style={
+                'textAlign': 'center',
+                'padding': '40px',
+                'color': '#dc3545'
+            }),
+            html.Button("← Back to Browse", 
+                       id="back-to-browse-btn", 
+                       style={
+                           'backgroundColor': '#6c757d',
+                           'color': 'white',
+                           'border': 'none',
+                           'padding': '10px 20px',
+                           'borderRadius': '4px',
+                           'cursor': 'pointer'
+                       })
         ])
+
+def create_browse_content():
+    """Create browse videos content"""
+    return html.Div([
+        html.H2("Browse Videos", style={'marginBottom': '20px'}),
+        
+        # Search and filters
+        html.Div([
+            dcc.Input(
+                id='search-input', 
+                type='text', 
+                placeholder='Search videos...', 
+                style={
+                    'width': '300px',
+                    'padding': '8px',
+                    'marginRight': '15px',
+                    'border': '1px solid #ddd',
+                    'borderRadius': '4px'
+                }
+            ),
+            dcc.Dropdown(
+                id='genre-filter',
+                options=[
+                    {'label': 'All Genres', 'value': 'all'},
+                    {'label': 'Education', 'value': 'education'},
+                    {'label': 'Technology', 'value': 'technology'},
+                    {'label': 'Travel', 'value': 'travel'},
+                    {'label': 'Cooking', 'value': 'cooking'},
+                    {'label': 'Fitness', 'value': 'fitness'},
+                    {'label': 'Entertainment', 'value': 'entertainment'}
+                ],
+                value='all',
+                style={'width': '200px'}
+            )
+        ], style={
+            'display': 'flex', 
+            'alignItems': 'center', 
+            'marginBottom': '20px'
+        }),
+        
+        html.Div(id='video-browse-results')
+    ])
+
+def create_saved_content(user_data):
+    """Create saved videos content"""
+    try:
+        saved_videos_df = db_manager.get_user_saved_videos(user_data['id'])
+        return html.Div([
+            html.H2("Saved Videos", style={'marginBottom': '20px'}),
+            create_video_grid(saved_videos_df.to_dict('records'), user_data) if not saved_videos_df.empty 
+            else html.Div("No saved videos yet.", style={
+                'textAlign': 'center',
+                'padding': '40px',
+                'color': '#666',
+                'fontSize': '18px'
+            })
+        ])
+    except Exception as e:
+        logging.error(f"Error creating saved content: {e}")
+        return html.Div("Error loading saved videos.")
+
+def create_upload_content():
+    """Create upload content"""
+    return html.Div([
+        html.H2("Upload Video", style={'marginBottom': '20px'}),
+        
+        html.Div(id="upload-status-display", style={'marginBottom': '20px'}),
+        
+        html.Div([
+            dcc.Upload(
+                id='upload-video',
+                children=html.Div([
+                    'Drag and Drop or ',
+                    html.A('Select Files')
+                ]),
+                style={
+                    'width': '100%',
+                    'height': '60px',
+                    'lineHeight': '60px',
+                    'borderWidth': '1px',
+                    'borderStyle': 'dashed',
+                    'borderRadius': '5px',
+                    'textAlign': 'center',
+                    'margin': '10px 0',
+                    'cursor': 'pointer'
+                },
+                multiple=False,
+                accept='video/*'
+            ),
+            
+            html.Div([
+                dcc.Input(
+                    id='video-title', 
+                    type='text', 
+                    placeholder='Video Title', 
+                    style={
+                        'width': '100%',
+                        'padding': '10px',
+                        'margin': '10px 0',
+                        'border': '1px solid #ddd',
+                        'borderRadius': '4px'
+                    }
+                ),
+                dcc.Textarea(
+                    id='video-description', 
+                    placeholder='Video Description', 
+                    style={
+                        'width': '100%',
+                        'height': '100px',
+                        'padding': '10px',
+                        'margin': '10px 0',
+                        'border': '1px solid #ddd',
+                        'borderRadius': '4px',
+                        'resize': 'vertical'
+                    }
+                ),
+                dcc.Dropdown(
+                    id='video-genre',
+                    options=[
+                        {'label': 'Education', 'value': 'education'},
+                        {'label': 'Technology', 'value': 'technology'},
+                        {'label': 'Travel', 'value': 'travel'},
+                        {'label': 'Cooking', 'value': 'cooking'},
+                        {'label': 'Fitness', 'value': 'fitness'},
+                        {'label': 'Entertainment', 'value': 'entertainment'}
+                    ],
+                    placeholder='Select Genre',
+                    style={'margin': '10px 0'}
+                ),
+                dcc.Dropdown(
+                    id='video-rating',
+                    options=[
+                        {'label': 'G - General Audience', 'value': 'G'},
+                        {'label': 'PG - Parental Guidance', 'value': 'PG'},
+                        {'label': '12+ - Ages 12 and up', 'value': '12+'},
+                        {'label': '18+ - Adults only', 'value': '18+'}
+                    ],
+                    value='PG',
+                    style={'margin': '10px 0'}
+                ),
+                html.Button("Upload Video", id="upload-submit-btn", style={
+                    'backgroundColor': '#28a745',
+                    'color': 'white',
+                    'border': 'none',
+                    'padding': '12px 24px',
+                    'borderRadius': '4px',
+                    'cursor': 'pointer',
+                    'fontSize': '16px'
+                })
+            ], id="upload-form", style={'display': 'none'})
+        ])
+    ])
+
+def create_my_videos_content(user_data):
+    """Create my videos content"""
+    try:
+        my_videos_df = db_manager.get_videos({'creator_id': user_data['id']})
+        return html.Div([
+            html.H2("My Videos", style={'marginBottom': '20px'}),
+            html.Div([
+                DataTable(
+                    data=my_videos_df.to_dict('records'),
+                    columns=[
+                        {'name': 'Title', 'id': 'title'},
+                        {'name': 'Genre', 'id': 'genre'},
+                        {'name': 'Views', 'id': 'view_count', 'type': 'numeric'},
+                        {'name': 'Likes', 'id': 'like_count', 'type': 'numeric'},
+                        {'name': 'Upload Date', 'id': 'upload_date'},
+                        {'name': 'Status', 'id': 'status'}
+                    ],
+                    style_cell={'textAlign': 'left', 'padding': '10px'},
+                    style_header={'backgroundColor': '#f8f9fa', 'fontWeight': 'bold'},
+                    style_data_conditional=[
+                        {
+                            'if': {'filter_query': '{status} = ready'},
+                            'backgroundColor': '#d4edda'
+                        }
+                    ]
+                ) if not my_videos_df.empty else html.Div("No videos uploaded yet.", style={
+                    'textAlign': 'center',
+                    'padding': '40px',
+                    'color': '#666'
+                })
+            ])
+        ])
+    except Exception as e:
+        logging.error(f"Error creating my videos content: {e}")
+        return html.Div("Error loading your videos.")
+
+def create_analytics_content():
+    """Create analytics content"""
+    return html.Div([
+        html.H2("Creator Analytics", style={'marginBottom': '20px'}),
+        html.Div([
+            html.Div(id='creator-metrics-cards', style={
+                'display': 'flex',
+                'gap': '20px',
+                'marginBottom': '30px'
+            }),
+            dcc.Graph(id='creator-performance-chart')
+        ])
+    ])
 
 # Main layout
 app.layout = html.Div([
     dcc.Location(id='url', refresh=False),
     dcc.Store(id='session-store', storage_type='session'),
+    # Add a hidden div that will contain dynamic content including back button
+    html.Div(id='dynamic-content', style={'display': 'none'}),
     html.Div(id='app-content')
 ])
 
-# Callbacks
-
+# Main page router
 @app.callback(
     Output('app-content', 'children'),
     [Input('url', 'pathname'),
@@ -825,6 +1428,104 @@ def display_page(pathname, session_data):
         logging.error(f"Error in display_page: {e}")
         return create_auth_layout()
 
+# Authentication content callback
+@app.callback(
+    Output('auth-content', 'children'),
+    [Input('auth-tabs', 'value')],
+    prevent_initial_call=False
+)
+def render_auth_content(active_tab):
+    """Render authentication content based on active tab"""
+    try:
+        input_style = {
+            'width': '100%',
+            'padding': '10px',
+            'margin': '10px 0',
+            'border': '1px solid #ddd',
+            'borderRadius': '4px'
+        }
+        
+        button_style = {
+            'width': '100%',
+            'padding': '12px',
+            'backgroundColor': '#007bff',
+            'color': 'white',
+            'border': 'none',
+            'borderRadius': '4px',
+            'cursor': 'pointer',
+            'marginTop': '10px'
+        }
+        
+        if active_tab == "login":
+            return html.Div([
+                dcc.Input(
+                    id="login-username", 
+                    type="text", 
+                    placeholder="Username", 
+                    style=input_style
+                ),
+                dcc.Input(
+                    id="login-password", 
+                    type="password", 
+                    placeholder="Password", 
+                    style=input_style
+                ),
+                html.Button(
+                    "Login", 
+                    id="login-btn", 
+                    style=button_style
+                ),
+                html.Div(id="login-message", style={'marginTop': '10px'})
+            ])
+        
+        elif active_tab == "register":
+            return html.Div([
+                dcc.Input(
+                    id="reg-username", 
+                    type="text", 
+                    placeholder="Username", 
+                    style=input_style
+                ),
+                dcc.Input(
+                    id="reg-email", 
+                    type="email", 
+                    placeholder="Email", 
+                    style=input_style
+                ),
+                dcc.Input(
+                    id="reg-password", 
+                    type="password", 
+                    placeholder="Password", 
+                    style=input_style
+                ),
+                dcc.Dropdown(
+                    id="reg-role",
+                    options=[
+                        {'label': 'Consumer (Watch videos)', 'value': 'consumer'},
+                        {'label': 'Creator (Upload videos)', 'value': 'creator'}
+                    ],
+                    placeholder="Select Role",
+                    style={'margin': '10px 0'}
+                ),
+                html.Button(
+                    "Register", 
+                    id="register-btn", 
+                    style=button_style
+                ),
+                html.Div(id="register-message", style={'marginTop': '10px'})
+            ])
+        
+        return html.Div("Select login or register.")
+    
+    except Exception as e:
+        logging.error(f"Error rendering auth content: {e}")
+        return html.Div("Error loading authentication form.", style={
+            'color': '#dc3545',
+            'textAlign': 'center',
+            'padding': '20px'
+        })
+
+# Login callback
 @app.callback(
     [Output('session-store', 'data'),
      Output('login-message', 'children')],
@@ -846,11 +1547,12 @@ def handle_login(n_clicks, username, password):
                 'user': user
             }, ""
         else:
-            return dash.no_update, html.Div("Invalid credentials", className="error-message")
+            return dash.no_update, html.Div("Invalid credentials", style={'color': '#dc3545'})
     except Exception as e:
         logging.error(f"Login error: {e}")
-        return dash.no_update, html.Div("Login failed. Please try again.", className="error-message")
+        return dash.no_update, html.Div("Login failed. Please try again.", style={'color': '#dc3545'})
 
+# Registration callback
 @app.callback(
     [Output('session-store', 'data', allow_duplicate=True),
      Output('register-message', 'children')],
@@ -883,11 +1585,14 @@ def handle_register(n_clicks, username, email, password, role):
                 'user': user_data
             }, ""
         else:
-            return dash.no_update, html.Div("Registration failed. Username or email may already exist.", className="error-message")
+            return dash.no_update, html.Div("Registration failed. Username or email may already exist.", 
+                                          style={'color': '#dc3545'})
     except Exception as e:
         logging.error(f"Registration error: {e}")
-        return dash.no_update, html.Div("Registration failed. Please try again.", className="error-message")
+        return dash.no_update, html.Div("Registration failed. Please try again.", 
+                                      style={'color': '#dc3545'})
 
+# Logout callback
 @app.callback(
     Output('session-store', 'data', allow_duplicate=True),
     [Input('logout-btn', 'n_clicks')],
@@ -899,210 +1604,133 @@ def handle_logout(n_clicks):
         return {}
     return dash.no_update
 
-# Updated main content callback with better error handling
+# Video card click handler - separate callback
 @app.callback(
-    [Output('main-content', 'children'),
+    [Output('current-video-store', 'data'),
      Output('navigation-store', 'data')],
-    [Input('main-tabs', 'value'),
-     Input({'type': 'back-to-browse-btn', 'index': ALL}, 'n_clicks')],
+    [Input({'type': 'video-card', 'index': ALL}, 'n_clicks')],
     [State('user-store', 'data'),
-     State('upload-status-store', 'data'),
-     State('current-video-store', 'data'),
-     State('navigation-store', 'data')],
+     State('current-video-store', 'data')],
     prevent_initial_call=True
 )
-def update_main_content(active_tab, back_clicks, user_data, upload_status, current_video, nav_data):
-    """Update main content based on selected tab"""
+def handle_video_card_clicks(video_clicks, user_data, current_video):
+    """Handle video card clicks to show video player"""
     try:
-        if not user_data:
-            return html.Div("Please login to continue."), {'current_page': 'login'}
+        if not user_data or not any(video_clicks):
+            return dash.no_update, dash.no_update
         
         ctx = callback_context
+        if ctx.triggered and 'video-card' in ctx.triggered[0]['prop_id']:
+            trigger_id = ctx.triggered[0]['prop_id']
+            if '"index":"' in trigger_id:
+                video_id = trigger_id.split('"index":"')[1].split('"')[0]
+                if video_id:
+                    # Track the view interaction
+                    analytics_engine.track_interaction(user_data['id'], video_id, 'view')
+                    
+                    return (
+                        {'video_id': video_id, 'show_player': True},
+                        {'show_video_player': True, 'video_id': video_id}
+                    )
         
-        # Check if back button was clicked
-        if ctx.triggered and any('back-to-browse-btn' in str(trigger['prop_id']) for trigger in ctx.triggered):
-            if any(back_clicks):
-                active_tab = 'browse'
-                current_video = {}
+        return dash.no_update, dash.no_update
+    except Exception as e:
+        logging.error(f"Error handling video card click: {e}")
+        return dash.no_update, dash.no_update
+
+# Back button handler - separate callback using pattern matching
+@app.callback(
+    Output('navigation-store', 'data', allow_duplicate=True),
+    [Input({'type': 'back-btn', 'index': ALL}, 'n_clicks')],
+    prevent_initial_call=True
+)
+def handle_back_button(back_clicks):
+    """Handle back button clicks"""
+    try:
+        if any(back_clicks):
+            return {'show_video_player': False, 'back_to_browse': True}
+        return dash.no_update
+    except Exception as e:
+        logging.error(f"Error handling back button: {e}")
+        return dash.no_update
+
+# Main content handler - updated to handle navigation
+@app.callback(
+    Output('main-content', 'children'),
+    [Input('main-tabs', 'value'),
+     Input('navigation-store', 'data')],
+    [State('user-store', 'data'),
+     State('current-video-store', 'data')],
+    prevent_initial_call=False
+)
+def update_main_content(active_tab, navigation_data, user_data, current_video):
+    """Handle main content updates based on tab selection and navigation"""
+    try:
+        if not user_data:
+            return html.Div("Please login to continue.")
         
-        # Handle video player display
-        if current_video and current_video.get('show_player') and current_video.get('video_id'):
-            video_data = db_manager.get_video_by_id(current_video['video_id'])
-            if video_data:
-                return create_video_player_layout(video_data, user_data), {'current_page': 'video_player'}
+        # Handle video player navigation
+        if navigation_data:
+            if navigation_data.get('show_video_player') and navigation_data.get('video_id'):
+                video_id = navigation_data['video_id']
+                video_data = db_manager.get_video_by_id(video_id)
+                if video_data:
+                    # Create video player with updated back button
+                    player_layout = create_video_player_layout(video_data, user_data)
+                    # Update the back button to use pattern matching
+                    if hasattr(player_layout, 'children'):
+                        for child in player_layout.children:
+                            if hasattr(child, 'id') and child.id == 'back-to-browse-btn':
+                                child.id = {'type': 'back-btn', 'index': 'video-player'}
+                    return player_layout
+            elif navigation_data.get('back_to_browse'):
+                # Force return to browse tab
+                return create_browse_content()
         
-        # Handle different tabs
+        # Handle tab-based content
         if active_tab == 'browse':
-            content = create_browse_content()
-            return content, {'current_page': 'browse'}
+            return create_browse_content()
         
-        elif active_tab == 'saved':
-            content = create_saved_content(user_data)
-            return content, {'current_page': 'saved'}
+        elif active_tab == 'saved' and user_data['role'] == UserRole.CONSUMER.value:
+            return create_saved_content(user_data)
         
         elif active_tab == 'upload' and user_data['role'] == UserRole.CREATOR.value:
-            content = create_upload_content(upload_status)
-            return content, {'current_page': 'upload'}
+            return create_upload_content()
         
         elif active_tab == 'my-videos' and user_data['role'] == UserRole.CREATOR.value:
-            content = create_my_videos_content(user_data)
-            return content, {'current_page': 'my_videos'}
+            return create_my_videos_content(user_data)
         
         elif active_tab == 'creator-analytics' and user_data['role'] == UserRole.CREATOR.value:
-            content = create_analytics_content()
-            return content, {'current_page': 'analytics'}
+            return create_analytics_content()
         
         else:
-            return html.Div("Page not found or insufficient permissions."), {'current_page': 'error'}
+            # Default to browse
+            return create_browse_content()
             
     except Exception as e:
-        logging.error(f"Error updating main content: {e}")
-        return html.Div("An error occurred. Please refresh the page."), {'current_page': 'error'}
+        logging.error(f"Error in main content handler: {e}")
+        error_content = html.Div([
+            html.H3("An error occurred"),
+            html.P("Please refresh the page or try again.")
+        ], style={'textAlign': 'center', 'padding': '40px'})
+        return error_content
 
-def create_browse_content():
-    """Create browse videos content"""
-    return html.Div([
-        html.H2("Browse Videos"),
-        
-        # Search and filters
-        html.Div([
-            dcc.Input(id='search-input', type='text', placeholder='Search videos...', className="search-input"),
-            dcc.Dropdown(
-                id='genre-filter',
-                options=[
-                    {'label': 'All Genres', 'value': 'all'},
-                    {'label': 'Education', 'value': 'education'},
-                    {'label': 'Technology', 'value': 'technology'},
-                    {'label': 'Travel', 'value': 'travel'},
-                    {'label': 'Cooking', 'value': 'cooking'},
-                    {'label': 'Fitness', 'value': 'fitness'},
-                    {'label': 'Entertainment', 'value': 'entertainment'}
-                ],
-                value='all',
-                className="genre-filter"
-            )
-        ], className="search-controls"),
-        
-        html.Div(id='video-browse-results')
-    ])
-
-def create_saved_content(user_data):
-    """Create saved videos content"""
-    try:
-        saved_videos_df = db_manager.get_user_saved_videos(user_data['id'])
-        return html.Div([
-            html.H2("Saved Videos"),
-            create_video_grid(saved_videos_df.to_dict('records'), user_data) if not saved_videos_df.empty 
-            else html.Div("No saved videos yet.", className="no-videos")
-        ])
-    except Exception as e:
-        logging.error(f"Error creating saved content: {e}")
-        return html.Div("Error loading saved videos.")
-
-def create_upload_content(upload_status):
-    """Create upload content"""
-    return html.Div([
-        html.H2("Upload Video"),
-        
-        # Display upload status if exists
-        html.Div(id="upload-status-display"),
-        
-        html.Div([
-            dcc.Upload(
-                id='upload-video',
-                children=html.Div([
-                    'Drag and Drop or ',
-                    html.A('Select Files')
-                ]),
-                className="upload-area",
-                multiple=False,
-                accept='video/*'
-            ),
-            
-            html.Div([
-                dcc.Input(id='video-title', type='text', placeholder='Video Title', className="form-input"),
-                dcc.Textarea(id='video-description', placeholder='Video Description', className="form-textarea"),
-                dcc.Dropdown(
-                    id='video-genre',
-                    options=[
-                        {'label': 'Education', 'value': 'education'},
-                        {'label': 'Technology', 'value': 'technology'},
-                        {'label': 'Travel', 'value': 'travel'},
-                        {'label': 'Cooking', 'value': 'cooking'},
-                        {'label': 'Fitness', 'value': 'fitness'},
-                        {'label': 'Entertainment', 'value': 'entertainment'}
-                    ],
-                    placeholder='Select Genre',
-                    className="form-dropdown"
-                ),
-                dcc.Dropdown(
-                    id='video-rating',
-                    options=[
-                        {'label': 'G - General Audience', 'value': 'G'},
-                        {'label': 'PG - Parental Guidance', 'value': 'PG'},
-                        {'label': '12+ - Ages 12 and up', 'value': '12+'},
-                        {'label': '18+ - Adults only', 'value': '18+'}
-                    ],
-                    value='PG',
-                    className="form-dropdown"
-                ),
-                html.Button("Upload Video", id="upload-submit", className="upload-button")
-            ], id="upload-form", style={'display': 'none'})
-        ])
-    ])
-
-def create_my_videos_content(user_data):
-    """Create my videos content"""
-    try:
-        my_videos_df = db_manager.get_videos({'creator_id': user_data['id']})
-        return html.Div([
-            html.H2("My Videos"),
-            html.Div([
-                DataTable(
-                    data=my_videos_df.to_dict('records'),
-                    columns=[
-                        {'name': 'Title', 'id': 'title'},
-                        {'name': 'Genre', 'id': 'genre'},
-                        {'name': 'Views', 'id': 'view_count', 'type': 'numeric'},
-                        {'name': 'Likes', 'id': 'like_count', 'type': 'numeric'},
-                        {'name': 'Upload Date', 'id': 'upload_date'},
-                        {'name': 'Status', 'id': 'status'}
-                    ],
-                    style_cell={'textAlign': 'left'},
-                    style_data_conditional=[
-                        {
-                            'if': {'filter_query': '{status} = ready'},
-                            'backgroundColor': '#d4edda'
-                        }
-                    ]
-                ) if not my_videos_df.empty else html.Div("No videos uploaded yet.")
-            ])
-        ])
-    except Exception as e:
-        logging.error(f"Error creating my videos content: {e}")
-        return html.Div("Error loading your videos.")
-
-def create_analytics_content():
-    """Create analytics content"""
-    return html.Div([
-        html.H2("Creator Analytics"),
-        html.Div([
-            html.Div(id='creator-metrics-cards', className="metrics-grid"),
-            dcc.Graph(id='creator-performance-chart')
-        ])
-    ])
-
+# Browse results callback
 @app.callback(
     Output('video-browse-results', 'children'),
-    [Input('search-input', 'value'),
+    [Input('main-tabs', 'value'),
+     Input('search-input', 'value'),
      Input('genre-filter', 'value'),
      Input('interval-component', 'n_intervals')],
     [State('user-store', 'data')],
     prevent_initial_call=True
 )
-def update_video_browse(search_query, genre_filter, n_intervals, user_data):
+def update_video_browse_results(active_tab, search_query, genre_filter, n_intervals, user_data):
     """Update video browse results"""
     try:
+        if active_tab != 'browse' or not user_data:
+            return dash.no_update
+            
         filters = {}
         if search_query:
             filters['search'] = search_query
@@ -1115,46 +1743,127 @@ def update_video_browse(search_query, genre_filter, n_intervals, user_data):
         logging.error(f"Error updating video browse: {e}")
         return html.Div("Error loading videos.")
 
-# Video interaction callbacks with better error handling
+# Video upload callback
 @app.callback(
-    [Output('current-video-store', 'data'),
-     Output('main-tabs', 'value')],
-    [Input({'type': 'video-card', 'index': ALL}, 'n_clicks')],
-    [State('user-store', 'data'),
-     State('current-video-store', 'data')],
+    [Output('upload-form', 'style'),
+     Output('upload-status-display', 'children')],
+    [Input('upload-video', 'contents'),
+     Input('upload-submit-btn', 'n_clicks')],
+    [State('upload-video', 'filename'),
+     State('video-title', 'value'),
+     State('video-description', 'value'),
+     State('video-genre', 'value'),
+     State('video-rating', 'value'),
+     State('user-store', 'data')],
     prevent_initial_call=True
 )
-def handle_video_click(n_clicks_list, user_data, current_video_store):
-    """Handle video card clicks and track interactions"""
+def handle_video_upload(contents, submit_clicks, filename, title, description, genre, rating, user_data):
+    """Handle video upload process"""
     try:
-        if not any(n_clicks_list) or not user_data:
+        ctx = callback_context
+        
+        if not ctx.triggered:
             return dash.no_update, dash.no_update
         
-        # Find which video was clicked
-        ctx = callback_context
-        if ctx.triggered:
-            prop_id = ctx.triggered[0]['prop_id']
-            if '"index":"' in prop_id:
-                video_id = prop_id.split('"index":"')[1].split('"')[0]
+        trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
+        
+        # Show form when file is selected
+        if trigger_id == 'upload-video' and contents:
+            if not filename:
+                return dash.no_update, html.Div("Please select a valid file.", style={'color': '#dc3545'})
+            
+            # Validate file type
+            if not any(filename.lower().endswith(ext) for ext in Config.ALLOWED_VIDEO_FORMATS):
+                return dash.no_update, html.Div(
+                    f"Unsupported file format. Allowed: {', '.join(Config.ALLOWED_VIDEO_FORMATS)}", 
+                    style={'color': '#dc3545'}
+                )
+            
+            status_message = html.Div(f"File selected: {filename}", style={'color': '#28a745'})
+            return {'display': 'block'}, status_message
+        
+        # Handle form submission
+        if trigger_id == 'upload-submit-btn' and submit_clicks and contents:
+            if not all([title, description, genre, rating]):
+                return dash.no_update, html.Div("Please fill in all fields.", style={'color': '#dc3545'})
+            
+            try:
+                # Decode and validate file
+                content_type, content_string = contents.split(',')
+                decoded = base64.b64decode(content_string)
                 
-                if video_id:
-                    # Track the view interaction
-                    analytics_engine.track_interaction(user_data['id'], video_id, 'view')
-                    
-                    # Set current video and show player
-                    return {'video_id': video_id, 'show_player': True}, 'browse'
+                if len(decoded) > Config.MAX_FILE_SIZE:
+                    return dash.no_update, html.Div("File too large. Maximum size: 100MB", style={'color': '#dc3545'})
+                
+                # Save file
+                video_id = str(uuid.uuid4())
+                file_extension = filename.split('.')[-1].lower()
+                file_path = os.path.join(Config.UPLOAD_FOLDER, f"{video_id}.{file_extension}")
+                
+                with open(file_path, 'wb') as f:
+                    f.write(decoded)
+                
+                # Simple content analysis for demo
+                content_tags = []
+                if 'tutorial' in title.lower() or 'learn' in description.lower():
+                    content_tags.append('educational')
+                if 'fun' in title.lower() or 'entertainment' in description.lower():
+                    content_tags.append('entertaining')
+                
+                # Analyze sentiment of description
+                sentiment_score = sentiment_analyzer.analyze_sentiment(description)
+                
+                # Create database entry
+                conn = db_manager.get_connection()
+                cursor = conn.cursor()
+                
+                cursor.execute("""
+                    INSERT INTO videos (id, title, description, creator_id, file_path, 
+                                      file_size, format, genre, age_rating, sentiment_score, content_tags)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """, (
+                    video_id, title, description, user_data['id'], file_path,
+                    len(decoded), file_extension, genre, rating, sentiment_score, json.dumps(content_tags)
+                ))
+                
+                conn.commit()
+                conn.close()
+                
+                success_message = html.Div([
+                    html.H4("Upload Successful!", style={'color': '#28a745', 'margin': '0 0 10px 0'}),
+                    html.P(f"Video '{title}' has been uploaded and is ready for viewing."),
+                    html.P(f"Sentiment Analysis Score: {sentiment_score:.2f}"),
+                    html.P(f"Content Tags: {', '.join(content_tags) if content_tags else 'None'}"),
+                    html.Button("Upload Another Video", 
+                               id="upload-another-btn", 
+                               style={
+                                   'backgroundColor': '#28a745',
+                                   'color': 'white',
+                                   'border': 'none',
+                                   'padding': '8px 16px',
+                                   'borderRadius': '4px',
+                                   'cursor': 'pointer',
+                                   'marginTop': '10px'
+                               })
+                ])
+                
+                return {'display': 'none'}, success_message
+                
+            except Exception as e:
+                error_message = html.Div(f"Upload failed: {str(e)}", style={'color': '#dc3545'})
+                return dash.no_update, error_message
         
         return dash.no_update, dash.no_update
     except Exception as e:
-        logging.error(f"Error handling video click: {e}")
-        return dash.no_update, dash.no_update
+        logging.error(f"Error in video upload: {e}")
+        return dash.no_update, html.Div("Upload failed. Please try again.", style={'color': '#dc3545'})
 
-# Like/Dislike/Save callbacks with better error handling
+# Like/Dislike buttons callback
 @app.callback(
     [Output('like-btn', 'children'),
-     Output('like-btn', 'className'),
+     Output('like-btn', 'style'),
      Output('dislike-btn', 'children'),
-     Output('dislike-btn', 'className')],
+     Output('dislike-btn', 'style')],
     [Input('like-btn', 'n_clicks'),
      Input('dislike-btn', 'n_clicks')],
     [State('user-store', 'data'),
@@ -1216,17 +1925,35 @@ def handle_like_dislike(like_clicks, dislike_clicks, user_data, current_video_st
         like_text = f"👍 {updated_video_data.get('like_count', 0):,}"
         dislike_text = f"👎 {updated_video_data.get('dislike_count', 0):,}"
         
-        like_class = f"interaction-btn {'liked' if is_liked else ''}"
-        dislike_class = f"interaction-btn {'disliked' if is_disliked else ''}"
+        like_style = {
+            'backgroundColor': '#28a745' if is_liked else '#f8f9fa',
+            'color': 'white' if is_liked else '#333',
+            'border': '1px solid #ddd',
+            'padding': '8px 16px',
+            'borderRadius': '4px',
+            'cursor': 'pointer',
+            'marginRight': '10px'
+        }
         
-        return like_text, like_class, dislike_text, dislike_class
+        dislike_style = {
+            'backgroundColor': '#dc3545' if is_disliked else '#f8f9fa',
+            'color': 'white' if is_disliked else '#333',
+            'border': '1px solid #ddd',
+            'padding': '8px 16px',
+            'borderRadius': '4px',
+            'cursor': 'pointer',
+            'marginRight': '10px'
+        }
+        
+        return like_text, like_style, dislike_text, dislike_style
     except Exception as e:
         logging.error(f"Error handling like/dislike: {e}")
         return dash.no_update, dash.no_update, dash.no_update, dash.no_update
 
+# Save button callback
 @app.callback(
     [Output('save-btn', 'children'),
-     Output('save-btn', 'className')],
+     Output('save-btn', 'style')],
     [Input('save-btn', 'n_clicks')],
     [State('user-store', 'data'),
      State('current-video-store', 'data')],
@@ -1244,143 +1971,162 @@ def handle_save_video(save_clicks, user_data, current_video_store):
         if is_saved:
             # Unsave video
             analytics_engine.unsave_video(user_data['id'], video_id)
-            return "💾 Save", "interaction-btn"
+            return "💾 Save", {
+                'backgroundColor': '#f8f9fa',
+                'color': '#333',
+                'border': '1px solid #ddd',
+                'padding': '8px 16px',
+                'borderRadius': '4px',
+                'cursor': 'pointer'
+            }
         else:
             # Save video
             analytics_engine.save_video(user_data['id'], video_id)
-            return "✅ Saved", "interaction-btn saved"
+            return "✅ Saved", {
+                'backgroundColor': '#17a2b8',
+                'color': 'white',
+                'border': '1px solid #ddd',
+                'padding': '8px 16px',
+                'borderRadius': '4px',
+                'cursor': 'pointer'
+            }
     except Exception as e:
         logging.error(f"Error handling save video: {e}")
         return dash.no_update, dash.no_update
 
+# Comments callback
 @app.callback(
-    [Output('upload-form', 'style'),
-     Output('upload-status-store', 'data'),
-     Output('upload-status-display', 'children')],
-    [Input('upload-video', 'contents'),
-     Input('upload-submit', 'n_clicks')],
-    [State('upload-video', 'filename'),
-     State('video-title', 'value'),
-     State('video-description', 'value'),
-     State('video-genre', 'value'),
-     State('video-rating', 'value'),
+    Output('comments-list', 'children'),
+    [Input('post-comment-btn', 'n_clicks'),
+     Input('interval-component', 'n_intervals')],
+    [State('comment-input', 'value'),
      State('user-store', 'data'),
-     State('upload-status-store', 'data')],
+     State('current-video-store', 'data')],
     prevent_initial_call=True
 )
-def handle_video_upload(contents, submit_clicks, filename, title, description, genre, rating, user_data, current_status):
-    """Handle video upload process"""
+def handle_comments(post_clicks, n_intervals, comment_text, user_data, current_video_store):
+    """Handle comment posting and display"""
     try:
+        if not current_video_store or not current_video_store.get('video_id'):
+            return []
+        
+        video_id = current_video_store['video_id']
+        
         ctx = callback_context
-        
-        if not ctx.triggered:
-            return dash.no_update, dash.no_update, dash.no_update
-        
-        trigger_id = ctx.triggered[0]['prop_id'].split('.')[0]
-        
-        # Show form when file is selected
-        if trigger_id == 'upload-video' and contents:
-            if not filename:
-                return dash.no_update, current_status, html.Div("Please select a valid file.", className="error-message")
-            
-            # Validate file type
-            if not any(filename.lower().endswith(ext) for ext in Config.ALLOWED_VIDEO_FORMATS):
-                return dash.no_update, current_status, html.Div(f"Unsupported file format. Allowed: {', '.join(Config.ALLOWED_VIDEO_FORMATS)}", className="error-message")
-            
-            status_message = html.Div(f"File selected: {filename}", className="success-message")
-            return {'display': 'block'}, {'file_selected': True, 'filename': filename}, status_message
-        
-        # Handle form submission
-        if trigger_id == 'upload-submit' and submit_clicks and contents:
-            if not all([title, description, genre, rating]):
-                return dash.no_update, current_status, html.Div("Please fill in all fields.", className="error-message")
-            
-            try:
-                # Decode and validate file
-                content_type, content_string = contents.split(',')
-                decoded = base64.b64decode(content_string)
-                
-                if len(decoded) > Config.MAX_FILE_SIZE:
-                    return dash.no_update, current_status, html.Div("File too large. Maximum size: 100MB", className="error-message")
-                
-                # Save file
-                video_id = str(uuid.uuid4())
-                file_extension = filename.split('.')[-1].lower()
-                file_path = os.path.join(Config.UPLOAD_FOLDER, f"{video_id}.{file_extension}")
-                
-                with open(file_path, 'wb') as f:
-                    f.write(decoded)
-                
-                # Simple content analysis for demo
-                content_tags = []
-                if 'tutorial' in title.lower() or 'learn' in description.lower():
-                    content_tags.append('educational')
-                if 'fun' in title.lower() or 'entertainment' in description.lower():
-                    content_tags.append('entertaining')
-                
-                # Analyze sentiment of description
-                sentiment_score = sentiment_analyzer.analyze_sentiment(description)
-                
-                # Create database entry
+        if ctx.triggered and ctx.triggered[0]['prop_id'] == 'post-comment-btn.n_clicks' and post_clicks:
+            if comment_text and comment_text.strip() and user_data:
+                # Add comment to database
                 conn = db_manager.get_connection()
                 cursor = conn.cursor()
                 
+                comment_id = str(uuid.uuid4())
+                sentiment_score = sentiment_analyzer.analyze_sentiment(comment_text)
+                
                 cursor.execute("""
-                    INSERT INTO videos (id, title, description, creator_id, file_path, 
-                                      file_size, format, genre, age_rating, sentiment_score, content_tags)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, (
-                    video_id, title, description, user_data['id'], file_path,
-                    len(decoded), file_extension, genre, rating, sentiment_score, json.dumps(content_tags)
-                ))
+                    INSERT INTO comments (id, video_id, user_id, content, sentiment_score)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (comment_id, video_id, user_data['id'], comment_text.strip(), sentiment_score))
                 
                 conn.commit()
                 conn.close()
-                
-                success_status = {
-                    'upload_complete': True,
-                    'video_title': title,
-                    'sentiment_score': sentiment_score,
-                    'content_tags': content_tags
-                }
-                
-                success_message = html.Div([
-                    html.H4("Upload Successful!", className="success-message"),
-                    html.P(f"Video '{title}' has been uploaded and is ready for viewing."),
-                    html.P(f"Sentiment Analysis Score: {sentiment_score:.2f}"),
-                    html.P(f"Content Tags: {', '.join(content_tags) if content_tags else 'None'}"),
-                    html.Button("Upload Another Video", id="upload-another-btn", className="upload-button", style={'margin-top': '10px'})
-                ])
-                
-                return {'display': 'none'}, success_status, success_message
-                
-            except Exception as e:
-                error_message = html.Div(f"Upload failed: {str(e)}", className="error-message")
-                return dash.no_update, current_status, error_message
         
-        return dash.no_update, current_status, dash.no_update
+        # Load and display comments
+        conn = db_manager.get_connection()
+        comments_df = pd.read_sql("""
+            SELECT c.*, u.username
+            FROM comments c
+            JOIN users u ON c.user_id = u.id
+            WHERE c.video_id = ?
+            ORDER BY c.created_at DESC
+        """, conn, params=[video_id])
+        conn.close()
+        
+        if comments_df.empty:
+            return [html.Div("No comments yet. Be the first to comment!", style={
+                'textAlign': 'center',
+                'padding': '20px',
+                'color': '#666',
+                'fontStyle': 'italic'
+            })]
+        
+        comment_elements = []
+        for _, comment in comments_df.iterrows():
+            comment_elements.append(
+                html.Div([
+                    html.Div([
+                        html.Strong(comment['username'], style={'color': '#007bff'}),
+                        html.Span(f" • {comment['created_at']}", style={
+                            'color': '#666',
+                            'fontSize': '12px',
+                            'marginLeft': '8px'
+                        })
+                    ]),
+                    html.P(comment['content'], style={
+                        'margin': '8px 0',
+                        'lineHeight': '1.5'
+                    }),
+                    html.Div([
+                        html.Span(f"Sentiment: {comment['sentiment_score']:.2f}", style={
+                            'fontSize': '11px',
+                            'color': '#999',
+                            'backgroundColor': '#f8f9fa',
+                            'padding': '2px 6px',
+                            'borderRadius': '4px'
+                        })
+                    ])
+                ], style={
+                    'padding': '12px',
+                    'borderBottom': '1px solid #eee',
+                    'marginBottom': '8px'
+                })
+            )
+        
+        return comment_elements
     except Exception as e:
-        logging.error(f"Error in video upload: {e}")
-        return dash.no_update, current_status, html.Div("Upload failed. Please try again.", className="error-message")
+        logging.error(f"Error handling comments: {e}")
+        return [html.Div("Error loading comments.")]
 
+# Clear comment input callback
+@app.callback(
+    Output('comment-input', 'value'),
+    [Input('post-comment-btn', 'n_clicks')],
+    [State('comment-input', 'value')],
+    prevent_initial_call=True
+)
+def clear_comment_input(n_clicks, comment_text):
+    """Clear comment input after posting"""
+    try:
+        if n_clicks and comment_text:
+            return ""
+        return dash.no_update
+    except Exception as e:
+        logging.error(f"Error clearing comment input: {e}")
+        return dash.no_update
+
+# Creator analytics callback
 @app.callback(
     [Output('creator-metrics-cards', 'children'),
      Output('creator-performance-chart', 'figure')],
-    [Input('interval-component', 'n_intervals')],
+    [Input('main-tabs', 'value'),
+     Input('interval-component', 'n_intervals')],
     [State('user-store', 'data')],
     prevent_initial_call=True
 )
-def update_creator_analytics(n_intervals, user_data):
+def update_creator_analytics(active_tab, n_intervals, user_data):
     """Update creator analytics dashboard"""
     try:
-        if not user_data or user_data['role'] != UserRole.CREATOR.value:
-            return [], {}
+        if active_tab != 'creator-analytics' or not user_data or user_data['role'] != UserRole.CREATOR.value:
+            return dash.no_update, dash.no_update
         
         # Get creator's video performance
         videos_df = db_manager.get_videos({'creator_id': user_data['id']})
         
         if videos_df.empty:
-            return [html.Div("No videos available for analysis.")], {}
+            return [html.Div("No videos available for analysis.", style={
+                'textAlign': 'center',
+                'padding': '40px',
+                'color': '#666'
+            })], {}
         
         # Calculate metrics
         total_videos = len(videos_df)
@@ -1389,26 +2135,35 @@ def update_creator_analytics(n_intervals, user_data):
         avg_sentiment = videos_df['sentiment_score'].mean()
         
         # Create metrics cards
+        card_style = {
+            'backgroundColor': 'white',
+            'padding': '20px',
+            'borderRadius': '8px',
+            'border': '1px solid #ddd',
+            'textAlign': 'center',
+            'minWidth': '150px'
+        }
+        
         metrics_cards = [
             html.Div([
-                html.H3(str(total_videos)),
-                html.P("Total Videos")
-            ], className="metric-card"),
+                html.H3(str(total_videos), style={'margin': '0 0 5px 0', 'fontSize': '24px', 'color': '#007bff'}),
+                html.P("Total Videos", style={'margin': '0', 'color': '#666'})
+            ], style=card_style),
             
             html.Div([
-                html.H3(f"{total_views:,}"),
-                html.P("Total Views")
-            ], className="metric-card"),
+                html.H3(f"{total_views:,}", style={'margin': '0 0 5px 0', 'fontSize': '24px', 'color': '#28a745'}),
+                html.P("Total Views", style={'margin': '0', 'color': '#666'})
+            ], style=card_style),
             
             html.Div([
-                html.H3(f"{total_likes:,}"),
-                html.P("Total Likes")
-            ], className="metric-card"),
+                html.H3(f"{total_likes:,}", style={'margin': '0 0 5px 0', 'fontSize': '24px', 'color': '#dc3545'}),
+                html.P("Total Likes", style={'margin': '0', 'color': '#666'})
+            ], style=card_style),
             
             html.Div([
-                html.H3(f"{avg_sentiment:.2f}"),
-                html.P("Avg. Sentiment")
-            ], className="metric-card")
+                html.H3(f"{avg_sentiment:.2f}", style={'margin': '0 0 5px 0', 'fontSize': '24px', 'color': '#17a2b8'}),
+                html.P("Avg. Sentiment", style={'margin': '0', 'color': '#666'})
+            ], style=card_style)
         ]
         
         # Create performance chart
@@ -1472,129 +2227,6 @@ def reset_upload_form(n_clicks):
     if n_clicks:
         return None, "", "", None, "PG"
     return dash.no_update, dash.no_update, dash.no_update, dash.no_update, dash.no_update
-
-# Comments functionality with better error handling
-@app.callback(
-    Output('comments-list', 'children'),
-    [Input('post-comment-btn', 'n_clicks'),
-     Input('interval-component', 'n_intervals')],
-    [State('comment-input', 'value'),
-     State('user-store', 'data'),
-     State('current-video-store', 'data')],
-    prevent_initial_call=True
-)
-def handle_comments(post_clicks, n_intervals, comment_text, user_data, current_video_store):
-    """Handle comment posting and display"""
-    try:
-        if not current_video_store or not current_video_store.get('video_id'):
-            return []
-        
-        video_id = current_video_store['video_id']
-        
-        ctx = callback_context
-        if ctx.triggered and ctx.triggered[0]['prop_id'] == 'post-comment-btn.n_clicks' and post_clicks:
-            if comment_text and comment_text.strip() and user_data:
-                # Add comment to database
-                conn = db_manager.get_connection()
-                cursor = conn.cursor()
-                
-                comment_id = str(uuid.uuid4())
-                sentiment_score = sentiment_analyzer.analyze_sentiment(comment_text)
-                
-                cursor.execute("""
-                    INSERT INTO comments (id, video_id, user_id, content, sentiment_score)
-                    VALUES (?, ?, ?, ?, ?)
-                """, (comment_id, video_id, user_data['id'], comment_text.strip(), sentiment_score))
-                
-                conn.commit()
-                conn.close()
-        
-        # Load and display comments
-        conn = db_manager.get_connection()
-        comments_df = pd.read_sql("""
-            SELECT c.*, u.username
-            FROM comments c
-            JOIN users u ON c.user_id = u.id
-            WHERE c.video_id = ?
-            ORDER BY c.created_at DESC
-        """, conn, params=[video_id])
-        conn.close()
-        
-        if comments_df.empty:
-            return [html.Div("No comments yet. Be the first to comment!", className="no-comments")]
-        
-        comment_elements = []
-        for _, comment in comments_df.iterrows():
-            comment_elements.append(
-                html.Div([
-                    html.Div([
-                        html.Strong(comment['username']),
-                        html.Span(f" • {comment['created_at']}", className="comment-time")
-                    ], className="comment-header"),
-                    html.P(comment['content'], className="comment-content"),
-                    html.Div([
-                        html.Span(f"Sentiment: {comment['sentiment_score']:.2f}", className="comment-sentiment")
-                    ], className="comment-meta")
-                ], className="comment-item")
-            )
-        
-        return comment_elements
-    except Exception as e:
-        logging.error(f"Error handling comments: {e}")
-        return [html.Div("Error loading comments.")]
-
-@app.callback(
-    Output('comment-input', 'value'),
-    [Input('post-comment-btn', 'n_clicks')],
-    [State('comment-input', 'value')],
-    prevent_initial_call=True
-)
-def clear_comment_input(n_clicks, comment_text):
-    """Clear comment input after posting"""
-    try:
-        if n_clicks and comment_text:
-            return ""
-        return dash.no_update
-    except Exception as e:
-        logging.error(f"Error clearing comment input: {e}")
-        return dash.no_update
-
-# Additional callback for handling back button in video player
-@app.callback(
-    [Output('current-video-store', 'data', allow_duplicate=True),
-     Output('main-tabs', 'value', allow_duplicate=True)],
-    [Input('back-to-browse-btn', 'n_clicks')],
-    [State('current-video-store', 'data')],
-    prevent_initial_call=True
-)
-def handle_back_to_browse(back_clicks, current_video_store):
-    """Handle back to browse button click"""
-    try:
-        if back_clicks and back_clicks > 0:
-            return {}, 'browse'
-        return dash.no_update, dash.no_update
-    except Exception as e:
-        logging.error(f"Error handling back to browse: {e}")
-        return dash.no_update, dash.no_update
-
-# Error handling for missing elements
-@app.callback(
-    Output('video-browse-results', 'children', allow_duplicate=True),
-    [Input('main-tabs', 'value')],
-    [State('user-store', 'data')],
-    prevent_initial_call=True
-)
-def initialize_browse_results(active_tab, user_data):
-    """Initialize browse results when browse tab is selected"""
-    try:
-        if active_tab == 'browse' and user_data:
-            videos_df = db_manager.get_videos()
-            return create_video_grid(videos_df.to_dict('records'), user_data)
-        return dash.no_update
-    except Exception as e:
-        logging.error(f"Error initializing browse results: {e}")
-        return html.Div("Error loading videos.")
-
 
 if __name__ == '__main__':
     # Setup logging
